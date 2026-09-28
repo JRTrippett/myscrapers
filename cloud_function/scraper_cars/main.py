@@ -6,14 +6,14 @@ from bs4 import BeautifulSoup
 from google.cloud import storage
 from flask import Request, jsonify
 
-# ---- Config (overridable via env vars in deploy.yml) ----
+# ---- Config (set with GitHub Variables; deploy.yml passes them to the function) ----
 BUCKET_NAME        = os.environ["BUCKET_NAME"]
-BASE_SITE          = os.environ.get("BASE_SITE", "https://newhaven.craigslist.org")
-SEARCH_PATH        = os.environ.get("SEARCH_PATH", "/search/cta")   # cars+trucks
+BASE_SITE          = os.environ.get("BASE_SITE", "").strip().rstrip("/")  # the site to scrape (GitHub Variable)
+SEARCH_PATH        = os.environ.get("SEARCH_PATH", "").strip() or "/search/cta"   # cars+trucks
 MAX_PAGES          = int(os.environ.get("MAX_PAGES", "1"))          # search pages to scan
 MAX_ITEMS_PER_RUN  = int(os.environ.get("MAX_ITEMS_PER_RUN", "50")) # safety cap per run
 DELAY_SECS         = float(os.environ.get("DELAY_SECS", "1.0"))     # polite delay between requests
-USER_AGENT         = os.environ.get("USER_AGENT", "UConn-OPIM-Student-Scraper/1.0")
+USER_AGENT         = os.environ.get("USER_AGENT", "").strip() or "student-project-scraper/1.0"
 
 HDRS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.8"}
 
@@ -106,12 +106,15 @@ def _upload_csv(bucket: str, object_name: str, rows: List[dict], header: List[st
 
 def entrypoint(request: Request):
     """HTTP GET. Optional query overrides:
-       ?pages=2&max=40&base=https://hartford.craigslist.org&path=/search/cta
+       ?pages=2&max=40&base=<your BASE_SITE>&path=/search/cta
     """
     pages = min(MAX_PAGES, int(request.args.get("pages", MAX_PAGES)))
     max_items = min(MAX_ITEMS_PER_RUN, int(request.args.get("max", MAX_ITEMS_PER_RUN)))
     base = request.args.get("base", BASE_SITE)
     path = request.args.get("path", SEARCH_PATH)
+    if not base:
+        return jsonify({"ok": False,
+                        "error": "BASE_SITE is not set. Add it as a GitHub Variable, then re-run the Deploy Scraper workflow."}), 500
 
     # 1) Build run folder: YYYYMMDDHHMMSS (UTC)
     run_id = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
