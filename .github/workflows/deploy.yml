@@ -21,6 +21,9 @@ env:
   ENTRY_POINT: entrypoint
   RUNTIME: python312
   BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+  BASE_SITE: ${{ vars.BASE_SITE }}
+  SEARCH_PATH: ${{ vars.SEARCH_PATH || '/search/cta' }}
+  USER_AGENT: ${{ vars.USER_AGENT || 'student-project-scraper/1.0' }}
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
@@ -49,6 +52,10 @@ jobs:
       - name: Deploy Cloud Function (Gen2, HTTP, authenticated)
         run: |
           set -euo pipefail
+          if [[ -z "${BASE_SITE}" ]]; then
+            echo "::error::BASE_SITE is missing. Add it under Settings > Secrets and variables > Actions > Variables, then re-run this workflow."
+            exit 1
+          fi
           SA_ARGS=()
           if [[ -n "${RUNTIME_SA:-}" ]]; then
             gcloud iam service-accounts describe "${RUNTIME_SA}" >/dev/null 2>&1
@@ -63,7 +70,7 @@ jobs:
             --trigger-http \
             --no-allow-unauthenticated \
             "${SA_ARGS[@]}" \
-            --set-env-vars="PROJECT_ID=${PROJECT_ID},BUCKET_NAME=${BUCKET_NAME}" \
+            --set-env-vars="PROJECT_ID=${PROJECT_ID},BUCKET_NAME=${BUCKET_NAME},BASE_SITE=${BASE_SITE},SEARCH_PATH=${SEARCH_PATH},USER_AGENT=${USER_AGENT}" \
             --memory=512Mi \
             --timeout=540s
 
