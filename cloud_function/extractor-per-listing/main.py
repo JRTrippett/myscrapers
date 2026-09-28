@@ -40,6 +40,8 @@ PRICE_RE      = re.compile(r"\$\s?([0-9,]+)")
 YEAR_RE       = re.compile(r"\b(19|20)\d{2}\b")
 MAKE_MODEL_RE = re.compile(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)")
 
+MAX_RUNS_PER_CALL = int(os.getenv("MAX_RUNS_PER_CALL", "24"))  # safety cap: scrape runs handled per call
+
 # -------------------- HELPERS --------------------
 def _list_run_ids(bucket: str, scrapes_prefix: str) -> list[str]:
     """
@@ -60,6 +62,18 @@ def _list_run_ids(bucket: str, scrapes_prefix: str) -> list[str]:
         if RUN_ID_ISO_RE.match(cand) or RUN_ID_PLAIN_RE.match(cand):
             run_ids.append(cand)
     return sorted(run_ids)
+
+def _extracted_run_ids(bucket: str, structured_prefix: str) -> set:
+    """run_ids that already have output under <structured_prefix>/run_id=<run_id>/"""
+    it = storage_client.list_blobs(bucket, prefix=f"{structured_prefix}/", delimiter="/")
+    for _ in it:
+        pass  # populate it.prefixes
+    done = set()
+    for pref in getattr(it, "prefixes", []):
+        tail = pref.rstrip("/").split("/")[-1]
+        if tail.startswith("run_id="):
+            done.add(tail.split("run_id=", 1)[1])
+    return done
 
 def _txt_objects_for_run(run_id: str) -> list[str]:
     """
@@ -154,7 +168,7 @@ def parse_listing(text: str) -> dict:
 # -------------------- HTTP ENTRY --------------------
 def extract_http(request: Request):
     """
-    Reads latest (or requested) run's TXT listings and writes ONE-LINE JSON records to:
+    Reads every not-yet-extracted run (or one requested run) of TXT listings and writes ONE-LINE JSON records to:
       gs://<bucket>/<STRUCTURED_PREFIX>/run_id=<run_id>/jsonl/<post_id>.jsonl
     Request JSON (optional):
       { "run_id": "<...>", "max_files": 0, "overwrite": false }
@@ -173,56 +187,66 @@ def extract_http(request: Request):
     max_files = int(body.get("max_files") or 0)        # 0 = unlimited
     overwrite = bool(body.get("overwrite") or False)
 
-    # Pick newest run if not provided
-    if not run_id:
+    # Which runs? A requested run_id, or EVERY scrape run that has not been extracted yet
+    # (so no batch is ever skipped, even if the scraper ran twice before the extractor).
+    if run_id:
+        runs_to_do = [run_id]
+    else:
         runs = _list_run_ids(BUCKET_NAME, SCRAPES_PREFIX)
         if not runs:
             return jsonify({"ok": False, "error": f"no run_ids found under {SCRAPES_PREFIX}/"}), 200
-        run_id = runs[-1]
-
-    scraped_at_iso = _parse_run_id_as_iso(run_id)
-
-    txt_blobs = _txt_objects_for_run(run_id)
-    if not txt_blobs:
-        return jsonify({"ok": False, "run_id": run_id, "error": "no .txt files found for run"}), 200
-    if max_files > 0:
-        txt_blobs = txt_blobs[:max_files]
+        done = _extracted_run_ids(BUCKET_NAME, STRUCTURED_PREFIX)
+        runs_to_do = [r for r in runs if r not in done]
+        if overwrite and runs[-1] not in runs_to_do:
+            runs_to_do.append(runs[-1])   # overwrite=true also refreshes the newest run (old behavior)
+        runs_to_do = runs_to_do[:MAX_RUNS_PER_CALL]
 
     processed = written = skipped = errors = 0
     bucket = storage_client.bucket(BUCKET_NAME)
+    runs_done = []
 
-    for name in txt_blobs:
-        try:
-            text = _download_text(name)
-            fields = parse_listing(text)
+    for rid in runs_to_do:
+        scraped_at_iso = _parse_run_id_as_iso(rid)
+        txt_blobs = _txt_objects_for_run(rid)
+        if not txt_blobs:
+            continue
+        if max_files > 0:
+            txt_blobs = txt_blobs[:max_files]
+        runs_done.append(rid)
 
-            post_id = os.path.splitext(os.path.basename(name))[0]
-            record = {
-                "post_id": post_id,
-                "run_id": run_id,
-                "scraped_at": scraped_at_iso,
-                "source_txt": name,
-                **fields,
-            }
+        for name in txt_blobs:
+            try:
+                text = _download_text(name)
+                fields = parse_listing(text)
 
-            out_key = f"{STRUCTURED_PREFIX}/run_id={run_id}/jsonl/{post_id}.jsonl"
+                post_id = os.path.splitext(os.path.basename(name))[0]
+                record = {
+                    "post_id": post_id,
+                    "run_id": rid,
+                    "scraped_at": scraped_at_iso,
+                    "source_txt": name,
+                    **fields,
+                }
 
-            if not overwrite and bucket.blob(out_key).exists():
-                skipped += 1
-            else:
-                _upload_jsonl_line(out_key, record)
-                written += 1
+                out_key = f"{STRUCTURED_PREFIX}/run_id={rid}/jsonl/{post_id}.jsonl"
 
-        except Exception as e:
-            errors += 1
-            logging.error(f"Failed {name}: {e}\n{traceback.format_exc()}")
+                if not overwrite and bucket.blob(out_key).exists():
+                    skipped += 1
+                else:
+                    _upload_jsonl_line(out_key, record)
+                    written += 1
 
-        processed += 1
+            except Exception as e:
+                errors += 1
+                logging.error(f"Failed {name}: {e}\n{traceback.format_exc()}")
+
+            processed += 1
 
     result = {
         "ok": True,
-        "version": "extractor-v3-jsonl-flex",
-        "run_id": run_id,
+        "version": "extractor-v4-all-new-runs",
+        "run_id": runs_done[-1] if runs_done else None,
+        "runs_processed": runs_done,
         "processed_txt": processed,
         "written_jsonl": written,
         "skipped_existing": skipped,
