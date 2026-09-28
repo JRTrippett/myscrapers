@@ -28,7 +28,7 @@ env:
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}                 # function runtime SA (email)
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}               # GitHub deploy SA (email)
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
-  SCHEDULE_BODY: ${{ vars.TRAIN_DT_BODY ||'{"dry_run":true}'}}
+  SCHEDULE_BODY: ${{ vars.TRAIN_DT_BODY || '{"dry_run":false}' }}
   CRON_EXPR: "20 * * * *"                             # :20 each hour (ET)
 
 jobs:

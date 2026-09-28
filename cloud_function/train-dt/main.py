@@ -1,4 +1,6 @@
 # Decision Tree: train on all data < today (local TZ); hold out today
+# Runs every hour. Each listing is predicted ONCE: the hourly file holds only listings that have not been
+# predicted before, and preds_master.csv keeps one row per listing (easy to chart later).
 # HTTP entrypoint: train_dt_http
 
 import os, io, json, logging, traceback, re
@@ -129,12 +131,35 @@ def run_once(dry_run: bool = False, max_depth: int = 12, min_samples_leaf: int =
     # --- Output path: HOURLY folder structure ---
     now_utc = pd.Timestamp.utcnow().tz_convert("UTC")
     out_key = f"{OUTPUT_PREFIX}/{now_utc.strftime('%Y%m%d%H')}/preds.csv"
+    master_key = f"{OUTPUT_PREFIX}/preds_master.csv"
 
-    if not dry_run and len(preds_df) > 0:
-        _write_csv_to_gcs(client, GCS_BUCKET, out_key, preds_df)
-        logging.info("Wrote predictions to gs://%s/%s (%d rows)", GCS_BUCKET, out_key, len(preds_df))
+    # --- Keep only listings we have NOT predicted before (no duplicates) ---
+    b = client.bucket(GCS_BUCKET)
+    master_blob = b.blob(master_key)
+    if master_blob.exists():
+        master_df = pd.read_csv(io.BytesIO(master_blob.download_as_bytes()), dtype={"post_id": str})
     else:
-        logging.info("Dry run or no holdout rows; skip write. Would write to gs://%s/%s", GCS_BUCKET, out_key)
+        master_df = pd.DataFrame()
+    already_predicted = set()
+    if "post_id" in master_df.columns:
+        already_predicted = set(master_df["post_id"].astype(str))
+
+    new_preds = preds_df
+    if len(preds_df) > 0:
+        is_new = ~preds_df["post_id"].astype(str).isin(already_predicted)
+        new_preds = preds_df[is_new].copy()
+        new_preds["post_id"] = new_preds["post_id"].astype(str)
+        new_preds["predicted_at"] = now_utc.isoformat()
+        new_preds["train_rows"] = int(len(train_df))
+
+    if not dry_run and len(new_preds) > 0:
+        _write_csv_to_gcs(client, GCS_BUCKET, out_key, new_preds)
+        updated_master = pd.concat([master_df, new_preds], ignore_index=True)
+        _write_csv_to_gcs(client, GCS_BUCKET, master_key, updated_master)
+        logging.info("Wrote %d NEW predictions to gs://%s/%s and appended them to %s",
+                     len(new_preds), GCS_BUCKET, out_key, master_key)
+    else:
+        logging.info("Dry run or no new listings to predict; skip write. Would write to gs://%s/%s", GCS_BUCKET, out_key)
 
     return {
         "status": "ok",
@@ -143,7 +168,10 @@ def run_once(dry_run: bool = False, max_depth: int = 12, min_samples_leaf: int =
         "holdout_rows": int(len(holdout_df)),
         "valid_price_rows": valid_price_rows,
         "mae_today": mae_today,
-        "output_key": out_key,
+        "new_predictions": int(len(new_preds)),
+        "already_predicted_skipped": int(len(preds_df) - len(new_preds)),
+        "output_key": out_key if (not dry_run and len(new_preds) > 0) else None,
+        "master_key": master_key,
         "dry_run": dry_run,
         "timezone": TIMEZONE,
     }

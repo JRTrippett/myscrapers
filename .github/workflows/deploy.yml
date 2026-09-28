@@ -27,7 +27,7 @@ env:
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
-  SCHEDULE_BODY: ${{ vars.SCHEDULE_BODY || '{"pages":1,"max":3}' }}
+  SCHEDULE_BODY: ${{ vars.SCHEDULE_BODY || '{"pages":1,"max":10}' }}   # 10 NEW listings per hour
   CRON_EXPR: "0 * * * *"         # :00 every hour; America/New_York set below
 
 jobs:
