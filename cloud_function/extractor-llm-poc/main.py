@@ -36,6 +36,8 @@ LLM_PROVIDER         = os.getenv("LLM_PROVIDER", "vertex").lower()
 LLM_MODEL            = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 OVERWRITE_DEFAULT    = os.getenv("OVERWRITE", "false").lower() == "true"
 MAX_FILES_DEFAULT    = int(os.getenv("MAX_FILES", "0") or 0)
+MAX_RUNS_PER_CALL    = int(os.getenv("MAX_RUNS_PER_CALL", "24"))   # safety cap: runs handled per call
+MAX_LLM_CALLS        = int(os.getenv("MAX_LLM_CALLS", "60"))       # safety cap: Vertex calls per call (cost control)
 
 # GCS READ RETRY - Use default transient error logic
 READ_RETRY = gax_retry.Retry(
@@ -93,6 +95,21 @@ def _list_structured_run_ids(bucket: str, structured_prefix: str) -> list[str]:
             if RUN_ID_ISO_RE.match(cand) or RUN_ID_PLAIN_RE.match(cand):
                 runs.append(cand)
     return sorted(runs)
+
+
+def _llm_pending(bucket: str, run_id: str) -> bool:
+    """True if this run has regex JSONL inputs without matching LLM outputs yet."""
+    bucket_obj = storage_client.bucket(bucket)
+    base = f"{STRUCTURED_PREFIX}/run_id={run_id}/"
+    n_in = 0
+    for b in bucket_obj.list_blobs(prefix=base + "jsonl/"):
+        if b.name.endswith(".jsonl"):
+            n_in += 1
+    n_out = 0
+    for b in bucket_obj.list_blobs(prefix=base + "jsonl_llm/"):
+        if b.name.endswith(".jsonl"):
+            n_out += 1
+    return n_in > n_out
 
 
 def _normalize_run_id_iso(run_id: str) -> str:
@@ -237,7 +254,7 @@ def _vertex_extract_fields(raw_text: str) -> dict:
 # -------------------- HTTP ENTRY --------------------
 def llm_extract_http(request: Request):
     """
-    Reads latest (or requested) run's per-listing JSONL inputs and writes LLM outputs.
+    Reads every run whose listings lack LLM output (or one requested run) and writes LLM outputs.
     """
     logging.getLogger().setLevel(logging.INFO)
 
@@ -258,86 +275,99 @@ def llm_extract_http(request: Request):
     max_files = int(body.get("max_files") or MAX_FILES_DEFAULT or 0)
     overwrite = bool(body.get("overwrite")) if "overwrite" in body else OVERWRITE_DEFAULT
 
-    # Pick newest run if not provided
-    if not run_id:
+    # Which runs? A requested run_id, or EVERY run whose listings do not have LLM output yet.
+    if run_id:
+        runs_to_do = [run_id]
+    else:
         runs = _list_structured_run_ids(BUCKET_NAME, STRUCTURED_PREFIX)
         if not runs:
             return jsonify({"ok": False, "error": f"no run_ids found under {STRUCTURED_PREFIX}/"}), 200
-        run_id = runs[-1]
-
-    structured_iso = _normalize_run_id_iso(run_id)
-
-    inputs = _list_per_listing_jsonl_for_run(BUCKET_NAME, run_id)
-    if not inputs:
-        return jsonify({"ok": True, "run_id": run_id, "processed": 0, "written": 0, "skipped": 0, "errors": 0}), 200
-    if max_files > 0:
-        inputs = inputs[:max_files]
-
-    logging.info(f"Starting LLM extraction for run_id={run_id} ({len(inputs)} files to process)")
+        runs_to_do = []
+        for r in runs:
+            if overwrite or _llm_pending(BUCKET_NAME, r):
+                runs_to_do.append(r)
+        runs_to_do = runs_to_do[-MAX_RUNS_PER_CALL:] if overwrite else runs_to_do[:MAX_RUNS_PER_CALL]
 
     processed = written = skipped = errors = 0
+    llm_calls = 0
+    runs_done = []
 
-    for in_key in inputs:
-        processed += 1
-        try:
-            # Read the tiny JSON line (single record)
-            raw_line = _download_text(in_key).strip()
-            if not raw_line:
-                raise ValueError("empty input jsonl")
-            base_rec = json.loads(raw_line)
+    for rid in runs_to_do:
+        structured_iso = _normalize_run_id_iso(rid)
+        inputs = _list_per_listing_jsonl_for_run(BUCKET_NAME, rid)
+        if not inputs:
+            continue
+        if max_files > 0:
+            inputs = inputs[:max_files]
+        runs_done.append(rid)
+        logging.info(f"Starting LLM extraction for run_id={rid} ({len(inputs)} files to process)")
 
-            post_id = base_rec.get("post_id")
-            if not post_id:
-                raise ValueError("missing post_id in input record")
+        for in_key in inputs:
+            if llm_calls >= MAX_LLM_CALLS:
+                break   # cost cap reached; the rest are picked up next hour
+            processed += 1
+            try:
+                # Read the tiny JSON line (single record)
+                raw_line = _download_text(in_key).strip()
+                if not raw_line:
+                    raise ValueError("empty input jsonl")
+                base_rec = json.loads(raw_line)
 
-            source_txt_key = base_rec.get("source_txt")
-            if not source_txt_key:
-                raise ValueError("missing source_txt in input record")
+                post_id = base_rec.get("post_id")
+                if not post_id:
+                    raise ValueError("missing post_id in input record")
 
-            # Output path: uses 'jsonl_llm/' folder
-            out_prefix = in_key.rsplit("/", 2)[0] + "/jsonl_llm"
-            out_key = out_prefix + f"/{post_id}_llm.jsonl"
+                source_txt_key = base_rec.get("source_txt")
+                if not source_txt_key:
+                    raise ValueError("missing source_txt in input record")
 
-            if not overwrite and _blob_exists(out_key):
-                skipped += 1
-                continue
+                # Output path: uses 'jsonl_llm/' folder
+                out_prefix = in_key.rsplit("/", 2)[0] + "/jsonl_llm"
+                out_key = out_prefix + f"/{post_id}_llm.jsonl"
 
-            # Fetch the raw listing TXT; send to LLM
-            raw_listing = _download_text(source_txt_key)
+                if not overwrite and _blob_exists(out_key):
+                    skipped += 1
+                    continue
 
-            parsed = _vertex_extract_fields(raw_listing)
+                # Fetch the raw listing TXT; send to LLM
+                raw_listing = _download_text(source_txt_key)
 
-            # Compose final record
-            out_record = {
-                "post_id": post_id,
-                "run_id": base_rec.get("run_id", run_id),
-                "scraped_at": base_rec.get("scraped_at", structured_iso),
-                "source_txt": source_txt_key,
-                "price": parsed.get("price"),
-                "year": parsed.get("year"),
-                "make": parsed.get("make"),
-                "model": parsed.get("model"),
-                "mileage": parsed.get("mileage"),
-                "llm_provider": "vertex",
-                "llm_model": LLM_MODEL,
-                "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            }
+                llm_calls += 1
+                parsed = _vertex_extract_fields(raw_listing)
 
-            _upload_jsonl_line(out_key, out_record)
-            written += 1
+                # Compose final record
+                out_record = {
+                    "post_id": post_id,
+                    "run_id": base_rec.get("run_id", rid),
+                    "scraped_at": base_rec.get("scraped_at", structured_iso),
+                    "source_txt": source_txt_key,
+                    "price": parsed.get("price"),
+                    "year": parsed.get("year"),
+                    "make": parsed.get("make"),
+                    "model": parsed.get("model"),
+                    "mileage": parsed.get("mileage"),
+                    "llm_provider": "vertex",
+                    "llm_model": LLM_MODEL,
+                    "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
 
-        except Exception as e:
-            errors += 1
-            logging.error(f"LLM extraction failed for {in_key}: {e}\n{traceback.format_exc()}")
+                _upload_jsonl_line(out_key, out_record)
+                written += 1
+
+            except Exception as e:
+                errors += 1
+                logging.error(f"LLM extraction failed for {in_key}: {e}\n{traceback.format_exc()}")
 
     result = {
         "ok": True,
-        "version": "extractor-llm-poc",
-        "run_id": run_id,
+        "version": "extractor-llm-poc-v2-all-new-runs",
+        "run_id": runs_done[-1] if runs_done else None,
+        "runs_processed": runs_done,
         "processed": processed,
         "written": written,
         "skipped": skipped,
         "errors": errors,
+        "llm_calls": llm_calls,
     }
     logging.info(json.dumps(result))
     return jsonify(result), 200
